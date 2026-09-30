@@ -1,0 +1,13 @@
+{
+  "include": ["mrfreecad", "InitGui.py", "tests", "scripts"],
+  "extraPaths": ["stubs"],
+  "pythonVersion": "3.8",
+  "typeCheckingMode": "basic",
+  "reportMissingModuleSource": false,
+  "reportMissingImports": "warning",
+  "reportOptionalMemberAccess": "error",
+  "reportOptionalSubscript": "error",
+  "reportOptionalCall": "error",
+  "reportOptionalIterable": "error",
+  "reportOptionalContextManager": "error"
+}

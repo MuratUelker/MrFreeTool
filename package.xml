@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
+  <name>MrFreeTool</name>
+  <description>
+    FreeCAD automation workbench for sheet-metal production: antet drawing notes
+    (Zimba / Lazer), Qty and scale handling, automatic drawing creation from a
+    flat pattern, TechDraw template (sheet format) swapping, flat pattern DXF
+    and PNG export, screencap + PDF assembly sheets, part normalisation
+    (thickness / K-factor / material properties), colour randomisation and
+    external document reference repair.
+  </description>
+  <version>1.0.0</version>
+  <date>2026-10-01</date>
+  <maintainer email="murat@ulker.dev">Murat Ulker</maintainer>
+  <license file="LICENSE">MIT</license>
+  <url type="repository" branch="main">https://github.com/MuratUelker/MrFreeTool</url>
+  <url type="bugtracker">https://github.com/MuratUelker/MrFreeTool/issues</url>
+  <url type="readme">https://github.com/MuratUelker/MrFreeTool/blob/main/README.md</url>
+  <icon>icons/mrfreetool.svg</icon>
+
+  <content>
+    <workbench>
+      <classname>MrFreeWorkbench</classname>
+      <subdirectory>./</subdirectory>
+      <icon>icons/mrfreetool.svg</icon>
+      <name>MrFreeTool</name>
+      <description>MrFreeTool sheet-metal production helpers</description>
+      <tag>drawing</tag>
+      <tag>sheetmetal</tag>
+      <tag>dxf</tag>
+      <tag>production</tag>
+    </workbench>
+  </content>
+
+  <freecadmin>1.0</freecadmin>
+</package>
