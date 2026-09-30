@@ -11,6 +11,7 @@ without needing a running FreeCAD.
 import os
 import tempfile
 import unittest
+from typing import Any, Optional
 
 from tests import _bootstrap  # noqa: F401  (path setup)
 
@@ -45,6 +46,13 @@ class FakeDocument:
 
 
 class FakeObject:
+    """Enough of a TechDraw object for the code under test.
+
+    Modelled on the real API, which differs from the obvious guess in two ways
+    that cost real bugs: a template is attached via ``page.Template`` rather
+    than ``page.addView()``, and ``DrawPage`` has no ``ScaleType``.
+    """
+
     def __init__(self, type_id, name, document=None):
         self.TypeId = type_id
         self.Name = name
@@ -56,17 +64,28 @@ class FakeObject:
         self.Y = 0.0
         self.Views = []
         self.Scale = 1.0
-        self.ScaleType = "Page"
-        self.Template = ""
+        # An unset template reads as None on a real DrawPage.
+        self.Template: Any = None
         self.Height = 0.0
         self.Width = 0.0
 
     def addView(self, view):
+        # Mirrors TechDraw: only views, never a template.
+        if getattr(view, "TypeId", "") == "TechDraw::DrawSVGTemplate":
+            raise RuntimeError("argument 1 must be TechDraw.DrawView, not DrawSVGTemplate")
         self.Views.append(view)
 
     def removeView(self, view):
         if view in self.Views:
             self.Views.remove(view)
+
+
+class FakeView(FakeObject):
+    """A view has ScaleType; a page does not."""
+
+    def __init__(self, type_id, name, document=None):
+        super().__init__(type_id, name, document)
+        self.ScaleType = "Page"
 
 
 def make_page(template="A3_Landscape", width=420.0, height=297.0, with_template=True):
@@ -78,7 +97,8 @@ def make_page(template="A3_Landscape", width=420.0, height=297.0, with_template=
         template_obj.Template = "/tmp/" + template
         template_obj.Width = width
         template_obj.Height = height
-        page.addView(template_obj)
+        # A template attaches through the property, never through addView().
+        page.Template = template_obj
     return doc, page
 
 
@@ -149,10 +169,29 @@ class PageScaleTests(unittest.TestCase):
         self.assertTrue(drawing.set_page_scale(page, (1, 25)))
         self.assertEqual(drawing.page_scale(page), (1, 25))
 
-    def test_set_page_scale_switches_to_custom(self):
+    def test_set_page_scale_moves_views_onto_the_page_scale(self):
+        # DrawPage has no ScaleType; what matters is that a view set to Automatic
+        # (which would pick its own scale) follows the page instead.
         _doc, page = make_page()
-        drawing.set_page_scale(page, (1, 7))
-        self.assertEqual(page.ScaleType, "Custom")
+        view = FakeView("TechDraw::DrawViewPart", "V", page.Document)
+        view.ScaleType = "Automatic"
+        page.addView(view)
+
+        self.assertTrue(drawing.set_page_scale(page, (1, 7)))
+
+        self.assertEqual(view.ScaleType, "Page")
+        self.assertAlmostEqual(page.Scale, 1.0 / 7.0, places=9)
+
+    def test_an_explicit_custom_view_scale_is_left_alone(self):
+        # A per-view Custom scale is a deliberate choice and must survive.
+        _doc, page = make_page()
+        view = FakeView("TechDraw::DrawViewPart", "V", page.Document)
+        view.ScaleType = "Custom"
+        page.addView(view)
+
+        drawing.set_page_scale(page, (1, 10))
+
+        self.assertEqual(view.ScaleType, "Custom")
 
     def test_apply_scale_index(self):
         _doc, page = make_page()
@@ -175,9 +214,14 @@ class TemplateTests(unittest.TestCase):
         _doc, page = make_page(width=594.0, height=420.0)
         self.assertEqual(drawing.page_size_mm(page), (594.0, 420.0))
 
+    def test_page_template_finds_the_attached_object(self):
+        _doc, page = make_page()
+        self.assertIsNotNone(drawing.page_template(page))
+        self.assertIs(drawing.page_template(page), page.Template)
+
     def test_orientation_from_file_name(self):
         _doc, landscape = make_page(template="Antet Yatay.svg")
-        _doc, portrait = make_page(template="Antet Dikey.svg")
+        _doc2, portrait = make_page(template="Antet Dikey.svg")
         self.assertEqual(drawing.template_orientation(landscape), "landscape")
         self.assertEqual(drawing.template_orientation(portrait), "portrait")
 
@@ -219,10 +263,11 @@ class TemplateTests(unittest.TestCase):
         self.assertEqual(drawing.page_scale(page), (1, 10))
 
     def test_apply_template_adds_a_template_when_absent(self):
-        doc, page = make_page(with_template=False)
+        _doc, page = make_page(with_template=False)
         template = drawing.apply_template(page, self.template_path)
         self.assertIsNotNone(template)
-        self.assertTrue(any(v.TypeId == "TechDraw::DrawSVGTemplate" for v in page.Views))
+        self.assertIs(page.Template, template)
+        self.assertEqual(template.Template, self.template_path)
 
 
 class AnnotationTests(unittest.TestCase):

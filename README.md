@@ -65,6 +65,19 @@ blank, so it works out of the box but will not carry your own title block.
 - **Export Sayfa Dxf** — the whole page, annotations included.
 - **Export Png** — the sheet as a PNG at its own paper size and 300 dpi.
 
+The DXF is written by MrFreeTool itself, in ASCII **DXF R12**, with bend lines
+placed on their own layer:
+
+> FreeCAD has no working shape-to-DXF export. `Import.export` silently creates
+> no file for a `.dxf` target (it returns `None`), and there is no
+> `TechDraw.writeDXFShape`. See `mrfreecad/dxf.py`.
+
+Bend lines go on a `BEND` layer and the profile on `CUT`, so a laser configured
+to cut only `CUT` ignores them. Entities are `LINE`, `ARC`, `CIRCLE` and
+R12 `POLYLINE` (not `LWPOLYLINE`, which some controllers reject); curves are
+discretised to a 0.02 mm chord, and edges perpendicular to the sheet are dropped
+because DXF is 2D and a zero-length line can make a controller reject the file.
+
 ### Normalize
 
 - **Norm Part** — writes the metadata the rest of the toolchain reads:
@@ -93,14 +106,24 @@ blank, so it works out of the box but will not carry your own title block.
 | `Annotation` / `Note` | `TechDraw::DrawViewAnnotation` |
 | `SetupSheet5` | template swap + `Page.Scale` |
 | `Create3rdAngleViews` | three `TechDraw::DrawViewPart` objects |
-| `ExportToDWG2` | `Import.export()` |
+| `ExportToDWG2` | own DXF R12 writer (`mrfreecad/dxf.py`) |
 | `InsertSheetMetalBaseFlange2` | thickness/K-factor metadata (see below) |
 | `MaterialPropertyValues` | `ViewObject.DiffuseColor` |
 | `HKEY_CURRENT_USER\Software\MrSWTool` | `BaseApp/Preferences/Mod/MrFreeTool` |
 | `GetDocumentDependencies2` / `ReplaceReferencedDocument` | `Document.xml` XLink table in the `.FCStd` zip |
 
 Annotation positions are unchanged, because both systems put the page origin at
-the bottom-left in millimetres.
+the bottom-left in millimetres. Font sizes are converted: the original wrote
+`<FONT size=26PTS>`, while TechDraw's `TextSize` is a `Length` in millimetres,
+so 26 pt arrives as 9.17 mm and 13 pt as 4.59 mm.
+
+Two FreeCAD specifics worth knowing, both found by running against a real
+FreeCAD rather than by reading about it:
+
+- a template attaches through `page.Template`, **not** `page.addView()`, which
+  rejects it;
+- `DrawPage` has no `ScaleType` — that property is on the *views*, and a page is
+  driven by its `Scale` float.
 
 ## Two things that could not be ported literally
 
@@ -146,10 +169,20 @@ FreeCAD, which is why they are unit-testable.
 ## Development
 
 ```bash
-python3 scripts/run_tests.py            # 202 tests, no FreeCAD needed
+python3 scripts/run_tests.py            # 294 tests, no FreeCAD needed
 python3 scripts/run_tests.py -v naming  # one file, verbose
 QT_QPA_PLATFORM=offscreen python3 scripts/run_tests.py   # include the Qt tests
 ```
+
+Against a real FreeCAD — this is the suite that matters most, because it
+exercises the actual TechDraw object model, the DXF writer and the exporters:
+
+```bash
+python3 -m unittest tests.test_integration_free -v
+```
+
+It skips itself when no interpreter is found; point `FREECADCMD` at one
+otherwise. Verified on FreeCAD 1.1.3.
 
 Static analysis:
 
@@ -172,6 +205,7 @@ mrfreecad/
   drawing.py           annotations, Qty, scale, templates
   makedrw.py           automatic drawing creation, scale snapping
   flatpattern.py       flat pattern discovery
+  dxf.py               DXF R12 writer (FreeCAD has no shape-to-DXF export)
   export_dxf.py        flat pattern and page DXF
   export_png.py        page and viewport PNG
   screencap.py         A4 capture and assembly PDF
@@ -182,7 +216,7 @@ mrfreecad/
   raster.py            dependency-free PNG codec and compositing
   commands.py          command registry
   gui/                 workbench, panel, dialogs
-tests/                 unit tests
+tests/                 unit tests + FreeCAD integration tests
 ```
 
 ## Licence

@@ -139,15 +139,26 @@ def _page_origin_mm(page: Any) -> Tuple[float, float]:
 
 
 def _default_template(landscape: bool = True) -> str:
-    """A usable TechDraw template when the user has not configured one."""
+    """A usable TechDraw template when the user has not configured one.
+
+    Prefers an A3 sheet, which is what the shop's templates use, and within that
+    a ``blank`` template: the drawing that comes out of *Make Drw* is about to
+    be stamped with the antet notes, so inheriting an unrelated title block
+    would be worse than none.  Falls back to whatever FreeCAD ships.
+    """
     from mrfreecad.settings import builtin_templates
 
-    tag = "A3_Landscape" if landscape else "A3_Portrait"
-    for path in builtin_templates(landscape):
-        if tag.lower() in os.path.basename(path).lower():
-            return path
     candidates = builtin_templates(landscape)
-    return candidates[0] if candidates else ""
+    if not candidates:
+        return ""
+    for path in candidates:
+        name = os.path.basename(path).lower()
+        if name.startswith("a3_") and "blank" in name:
+            return path
+    for path in candidates:
+        if os.path.basename(path).lower().startswith("a3_"):
+            return path
+    return candidates[0]
 
 
 def make_drawing(
@@ -199,16 +210,16 @@ def make_drawing(
     page = doc.addObject("TechDraw::DrawPage", "Page")
     template = doc.addObject("TechDraw::DrawSVGTemplate", "Template")
     template.Template = template_path
-    page.addView(template)
+    # A template is attached through the Page.Template property, not addView(),
+    # which only accepts views.
+    page.Template = template
 
     centre_x, centre_y = _page_origin_mm(page)
 
     views: List[Any] = []
     if single_view:
-        view = _add_view(doc, page, source, "Front", (0.0, 0.0, 1.0), (1.0, 0.0, 0.0))
+        view = _add_view(doc, page, source, "Front", (0.0, 0.0, 1.0), (1.0, 0.0, 0.0), centre_x, centre_y)
         if view is not None:
-            view.X = centre_x
-            view.Y = centre_y
             views.append(view)
     else:
         # Orthogonal first/third-angle layout: front at the centre-left, top
@@ -225,12 +236,9 @@ def make_drawing(
             # The original replaced the *base* view with the flat pattern.
             sources[0] = flat_obj
         for source_obj, (label, direction, xdir), (x, y) in zip(sources, STANDARD_VIEWS, layout):
-            view = _add_view(doc, page, source_obj, label, direction, xdir)
-            if view is None:
-                continue
-            view.X = x
-            view.Y = y
-            views.append(view)
+            view = _add_view(doc, page, source_obj, label, direction, xdir, x, y)
+            if view is not None:
+                views.append(view)
 
     if not views:
         try:
@@ -269,8 +277,14 @@ def _add_view(
     label: str,
     direction: Sequence[float],
     x_direction: Sequence[float],
+    x: Optional[float] = None,
+    y: Optional[float] = None,
 ) -> Optional[Any]:
-    """Create a ``DrawViewPart`` looking along ``direction``."""
+    """Create a ``DrawViewPart`` looking along ``direction``.
+
+    ``x``/``y`` are applied *after* ``addView``: TechDraw centres a view when it
+    joins a page, discarding a position set beforehand.
+    """
     try:
         view = doc.addObject("TechDraw::DrawViewPart", "View")
     except Exception as exc:
@@ -287,8 +301,12 @@ def _add_view(
         pass
     try:
         page.addView(view)
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:
         compat.console_log("make_drawing: addView failed: " + str(exc))
+        return None
+    if x is not None and y is not None:
+        view.X = float(x)
+        view.Y = float(y)
     return view
 
 

@@ -41,7 +41,11 @@ PROP_MATERIAL = "Material"
 # Metadata
 # ---------------------------------------------------------------------------
 def _property_text(obj: Any, name: str) -> str:
-    """Read a document property as text, whether it stores a number or a string."""
+    """Read a document property as text, whether it stores a number or a string.
+
+    A non-text value (a dict, a list, an object) is deliberately not stringified
+    into a file name; ``normalize_name`` would fold it into nonsense.
+    """
     if obj is None:
         return ""
     try:
@@ -50,9 +54,13 @@ def _property_text(obj: Any, name: str) -> str:
         return ""
     if value is None:
         return ""
+    if isinstance(value, bool):
+        return ""
     if isinstance(value, (int, float)):
         return to_decimal(value, 3)
-    text = str(value).strip()
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
     # Strip the property linkage the SolidWorks original produced, e.g.
     # "Thickness@Bracket.SLDPRT" -> "1,5".
     for marker in ("@", "="):
@@ -117,14 +125,33 @@ def _guess_thickness(obj: Any) -> float:
 
 
 def read_material(obj: Any) -> str:
-    """Material name from the document, else from the shape's material."""
+    """Material name, preferring MrFreeTool's own property.
+
+    Order matters: FreeCAD 1.1's built-in ``Document.Material`` is an
+    ``App::PropertyMap`` (a dict of material assignments per object), so it is
+    read only after our own ``MrFreeMaterial`` string, and a dict is never
+    stringified into a file name.
+    """
     doc = _doc_of(obj)
-    for candidate in (doc, obj):
+    from mrfreecad.normalize import PROP_MATERIAL_WRITE
+
+    for candidate, name in ((doc, PROP_MATERIAL_WRITE), (obj, PROP_MATERIAL_WRITE)):
         if candidate is None:
             continue
-        text = _property_text(candidate, PROP_MATERIAL)
+        text = _property_text(candidate, name)
         if text:
             return text
+
+    # Legacy/alternative location: a plain string Material on the object.
+    for candidate in (obj, doc):
+        if candidate is None:
+            continue
+        if _property_type_of(candidate, PROP_MATERIAL) == "App::PropertyString":
+            text = _property_text(candidate, PROP_MATERIAL)
+            if text:
+                return text
+
+    # FreeCAD's material assignment on the shape.
     try:
         material = getattr(obj, "Shape", None)
         name = getattr(material, "Material", None)
@@ -133,6 +160,16 @@ def read_material(obj: Any) -> str:
     except Exception:
         pass
     return ""
+
+
+def _property_type_of(obj: Any, name: str) -> str:
+    getter = getattr(obj, "getTypeIdOfProperty", None)
+    if getter is None:
+        return ""
+    try:
+        return str(getter(name))
+    except Exception:
+        return ""
 
 
 def read_configuration(obj: Any) -> str:
@@ -190,47 +227,17 @@ def read_metadata(obj: Any) -> Tuple[str, str, str, str]:
 # ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
-def _import_export(objects: List[Any], path: str) -> bool:
-    """Write ``objects`` to ``path`` via FreeCAD's Import module.
+def _export_shape(shape: Any, path: str, doc: Any = None) -> Tuple[bool, str]:
+    """Write ``shape`` to ``path`` as DXF using MrFreeTool's own writer.
 
-    Returns ``True`` on success.  A non-zero return from the underlying exporter
-    is treated as failure, because a truncated DXF reaches the laser.
+    FreeCAD's ``Import.export`` silently writes nothing for a ``.dxf`` target
+    (verified on 1.1: it returns ``None`` and creates no file), so the writer in
+    :mod:`mrfreecad.dxf` is used instead.  That also means the caller chooses
+    what lands on the bend-line layer rather than filtering the finished text.
     """
-    try:
-        import Import  # type: ignore
-    except Exception as exc:
-        compat.console_log("Import module unavailable: " + str(exc))
-        return False
-    try:
-        Import.export(objects, path)
-    except Exception as exc:
-        compat.console_log("Import.export failed: " + str(exc))
-        return False
-    return os.path.isfile(path) and os.path.getsize(path) > 0
+    from mrfreecad import dxf as dxf_writer
 
-
-def _export_shape(shape: Any, path: str, doc: Any) -> bool:
-    """Export a raw ``Part.Shape`` by parking it in a temporary document object.
-
-    ``Import.export`` works on document objects, so a bare shape - which is what
-    an unfold feature sometimes exposes - needs a throwaway ``Part::Feature``.
-    The temp object is always removed, including on failure.
-    """
-    temp_obj = None
-    try:
-        temp_obj = doc.addObject("Part::Feature", "MrFreeTempFlat")
-        temp_obj.Shape = shape
-        doc.recompute()
-        return _import_export([temp_obj], path)
-    except Exception as exc:
-        compat.console_log("shape export failed: " + str(exc))
-        return False
-    finally:
-        if temp_obj is not None:
-            try:
-                doc.removeObject(temp_obj.Name)
-            except Exception:
-                pass
+    return dxf_writer.write_shape(shape, path)
 
 
 def export_flat_dxf(
@@ -307,69 +314,45 @@ def export_flat_dxf(
 
     path = filename if os.path.isabs(filename) else os.path.join(directory, filename)
 
-    # Prefer exporting the document object so DXF layers and the unfold's own
-    # bend-line edges survive; fall back to the raw shape.
-    ok = _import_export([flat_obj], path)
-    if not ok and shape is not None:
-        ok = _export_shape(shape, path, doc)
-
+    bend_edges = _bend_edges(flat_obj) if bend_lines else None
+    ok, detail = _export_shape(shape, path, doc)
     if not ok:
-        return (False, path, "DXF dışa aktarma başarısız.")
-
-    if not bend_lines:
-        stripped = _strip_bend_lines(path)
-        if stripped:
-            path = stripped
+        return (False, path, "DXF dışa aktarma başarısız: {0}".format(detail))
 
     message = "DXF dışa aktarıldı:\n{0}".format(path)
+    message += "\n\nAdet      : {0}".format(int(qty))
+    message += "\nMalzeme   : {0}".format(material or DEFAULT_MATERIAL)
+    message += "\nKalınlık  : {0} mm".format(thickness or "?")
+    message += "\nBüküm     : {}".format("var" if bend_lines else "yok")
+    if bend_edges:
+        message += " ({0} çizgi)".format(len(bend_edges))
     return (True, path, message)
 
 
-def _strip_bend_lines(path: str) -> str:
-    """Remove bend-line entities from a written DXF.
+def _bend_edges(obj: Any) -> List[Any]:
+    """Bend-line edges of an unfold feature, when it exposes any.
 
-    FreeCAD's exporter emits unfold bend lines as ordinary lines, so when the
-    user turns bend lines *off* they are filtered out by layer name.  Returns
-    the path that was actually written, or ``""`` when nothing had to change.
+    SheetMetal's unfold keeps its bend lines in a ``BendLines`` property; when
+    that is absent the bend lines are already part of the shape's edges and
+    there is nothing to separate, which is reported honestly rather than
+    guessed at.
     """
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            lines = handle.read().splitlines()
-    except OSError:
-        return ""
-
-    bend_layers = {"bend", "bendlines", "bend_lines", "kirim", "bukum", "büküm"}
-    keep = True
-    out: List[str] = []
-    index = 0
-    while index < len(lines):
-        line = lines[index].strip()
-        # DXF entity: 0 / LINE ... 8 / <layer>
-        if line == "0" and index + 7 < len(lines) and lines[index + 1].strip() in ("LINE", "ARC", "LWPOLYLINE"):
-            layer_index = None
-            probe = index + 2
-            while probe < len(lines) and lines[probe].strip() != "0":
-                if lines[probe].strip() == "8" and probe + 1 < len(lines):
-                    layer_index = probe + 1
-                    break
-                probe += 1
-            if layer_index is not None:
-                layer = lines[layer_index].strip().lower()
-                if layer in bend_layers:
-                    keep = False
-                    index += 1
-                    continue
-        out.append(lines[index])
-        index += 1
-    if keep:
-        return ""
-
-    try:
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write("\n".join(out))
-    except OSError:
-        return ""
-    return path
+    if obj is None:
+        return []
+    for name in ("BendLines", "BendLine", "Sketch"):
+        try:
+            value = getattr(obj, name, None)
+        except Exception:
+            continue
+        if value is None:
+            continue
+        edges = getattr(value, "Edges", None)
+        if edges:
+            try:
+                return list(edges)
+            except Exception:
+                pass
+    return []
 
 
 def export_page_dxf(page: Any = None, path: str = "") -> Tuple[bool, str, str]:

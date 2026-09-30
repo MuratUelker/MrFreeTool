@@ -10,6 +10,7 @@ in millimetres — so the millimetre tables below port over unchanged.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, List, Optional, Sequence, Tuple
 
 from mrfreecad import compat
@@ -45,6 +46,7 @@ __all__ = [
     "template_orientation",
     "page_size_mm",
     "is_landscape_template",
+    "page_template",
     "PAGE_ORIGIN_MM",
 ]
 
@@ -52,15 +54,29 @@ __all__ = [
 #: original's ``Annotation.SetPosition(x / 1000, y / 1000, 0)`` call.
 PAGE_ORIGIN_MM = (0.0, 0.0)
 
-#: Stamp (Zimba / Lazer) note placement.  26 pt bold, no leader.
+#: Stamp (Zimba / Lazer) note placement, 26 pt bold, no leader.
 ANNO_ZIMBA_LANDSCAPE = (258.0, 40.0)
 ANNO_ZIMBA_PORTRAIT = (172.0, 40.0)
-STAMP_FONT_SIZE = 26.0
 
-#: "simetriği de var" note placement.  13 pt bold, no leader.
+#: "simetriği de var" note placement, 13 pt bold, no leader.
 ANNO_SIMETRI_LANDSCAPE = (200.0, 37.0)
 ANNO_SIMETRI_PORTRAIT = (113.0, 37.0)
-SIMETRI_FONT_SIZE = 13.0
+
+#: Font sizes in **points**, matching the original's ``<FONT size=26PTS>``.
+#:
+#: TechDraw's ``DrawViewAnnotation.TextSize`` is an ``App::PropertyLength`` in
+#: millimetres, not a point size, so the conversion is explicit here rather than
+#: writing 26 and printing text nearly three times too large.
+STAMP_FONT_POINTS = 26.0
+SIMETRI_FONT_POINTS = 13.0
+
+#: Points to millimetres, for handing the two constants to TechDraw.
+POINTS_TO_MM = 25.4 / 72.0
+
+#: Resolved millimetre sizes.
+STAMP_FONT_SIZE = STAMP_FONT_POINTS * POINTS_TO_MM      # 9.17 mm
+SIMETRI_FONT_SIZE = SIMETRI_FONT_POINTS * POINTS_TO_MM  # 4.59 mm
+
 SIMETRI_TEXT = "simetriği de var"
 
 #: Denominators recognised when reading a page scale back, smallest first so the
@@ -234,6 +250,23 @@ def iter_annotations(page: Any) -> List[Any]:
 # ---------------------------------------------------------------------------
 # Template handling
 # ---------------------------------------------------------------------------
+def page_template(page: Any) -> Any:
+    """The template object attached to ``page``, or ``None``.
+
+    A template is not one of ``Page.Views``; it hangs off the ``Template``
+    property.  Older builds did keep it in the view list, so both are checked.
+    """
+    if page is None:
+        return None
+    template = getattr(page, "Template", None)
+    if template is not None:
+        return template
+    for view in getattr(page, "Views", []) or []:
+        if _is_template(view):
+            return view
+    return None
+
+
 def page_size_mm(page: Any) -> Tuple[float, float]:
     """Paper size of ``page`` in millimetres, from its template.
 
@@ -242,17 +275,17 @@ def page_size_mm(page: Any) -> Tuple[float, float]:
     """
     if page is None:
         return (297.0, 210.0)
-    for view in getattr(page, "Views", []) or []:
-        if not _is_template(view):
-            continue
-        width = _template_dimension(view, "Width")
-        height = _template_dimension(view, "Height")
+    template = page_template(page)
+    if template is not None:
+        width = _template_dimension(template, "Width")
+        height = _template_dimension(template, "Height")
         if width > 0 and height > 0:
             return (width, height)
     name = template_name(page)
+    upper = name.upper()
     for tag, w, h in PAPER_SIZES_MM:
-        if tag in name.upper():
-            portrait = "VERT" in name.upper() or "PORTRAIT" in name.upper()
+        if tag in upper:
+            portrait = "VERT" in upper or "PORTRAIT" in upper
             return (h, w) if portrait else (w, h)
     return (297.0, 210.0)
 
@@ -260,21 +293,50 @@ def page_size_mm(page: Any) -> Tuple[float, float]:
 def _template_dimension(template: Any, prop: str) -> float:
     """Read a template dimension in millimetres.
 
-    ``DrawSVGTemplate`` exposes the paper size as ``Width``/``Height`` in
-    millimetres already, and additionally as ``WidthScale``/``HeightScale``
-    enum values on newer builds.  No unit conversion happens here: a template
-    reporting 0.594 is a template reporting 0.594 *mm*, and rescaling it would
-    turn an A2 into a 594 m sheet.
+    ``DrawSVGTemplate`` exposes the paper size as ``Width``/``Height``.  The
+    exact type varies between builds - on some it is a float in millimetres, on
+    others an integer enum that FreeCAD resolves through ``getEnumerationsOfProperty``
+    - so several readings are tried before giving up.
+
+    No unit conversion happens here: the values are already millimetres, and
+    rescaling a 0.594 would turn an A2 into a 594 m sheet.
     """
     for name in (prop, prop + "Scale"):
-        try:
-            value = getattr(template, name)
-        except Exception:
-            continue
-        number = _as_float(value)
+        number = _as_float(getattr(template, name, None))
         if number > 0:
             return number
+
+    # Enum-valued builds: map the enum back to its millimetre meaning.
+    enum_name = getattr(template, "getEnumerationsOfProperty", None)
+    if enum_name is not None:
+        for name in (prop, prop + "Scale"):
+            try:
+                options = enum_name(name)
+            except Exception:
+                continue
+            current = str(getattr(template, name, ""))
+            for option in options or []:
+                # Entries look like "A3 Landscape 420.00 x 297.00".
+                text = str(option)
+                if not text.startswith(current):
+                    continue
+                numbers = _numbers_in(text)
+                if len(numbers) >= 2:
+                    return float(numbers[0]) if name.lower().startswith("width") else float(numbers[1])
+                if numbers:
+                    return float(numbers[0])
     return 0.0
+
+
+def _numbers_in(text: str) -> List[float]:
+    """Every decimal number in ``text``, in order."""
+    found = []
+    for chunk in re.findall(r"\d+(?:[.,]\d+)?", text):
+        try:
+            found.append(float(chunk.replace(",", ".")))
+        except ValueError:
+            continue
+    return found
 
 
 def _as_float(value: Any) -> float:
@@ -287,15 +349,13 @@ def _as_float(value: Any) -> float:
 
 def template_name(page: Any) -> str:
     """File name of the template attached to ``page``."""
-    if page is None:
+    template = page_template(page)
+    if template is None:
         return ""
-    for view in getattr(page, "Views", []) or []:
-        if _is_template(view):
-            try:
-                return os.path.basename(str(view.Template))
-            except Exception:
-                continue
-    return ""
+    try:
+        return os.path.basename(str(template.Template))
+    except Exception:
+        return ""
 
 
 def is_landscape_template(page: Any) -> bool:
@@ -340,9 +400,10 @@ def apply_template(page: Any, template_path: str, keep_scale: bool = True) -> An
 
     The SolidWorks original clears the sheet before loading a new format,
     because leaving the old one in place makes the two formats' notes overlap.
-    FreeCAD's template object is already separate from the page's views, so
-    replacing it is enough — but stale notes *are* a real problem, so they are
-    removed here, mirroring the original's two-step ``SetupSheet5`` dance.
+    FreeCAD's template lives outside ``Page.Views`` and is attached through the
+    ``Template`` property, so replacing it is enough — but stale notes *are* a
+    real problem, so they are removed here, mirroring the original's two-step
+    ``SetupSheet5`` dance.
 
     Returns the template object, or ``None`` when the path is unusable.
     """
@@ -353,30 +414,28 @@ def apply_template(page: Any, template_path: str, keep_scale: bool = True) -> An
 
     remove_annotations_containing(page, "")  # drop the previous format's notes
 
-    template = None
-    for view in getattr(page, "Views", []) or []:
-        if _is_template(view):
-            template = view
-            break
-    if template is None:
+    # A page with no template returns None (or, on some builds, an empty
+    # placeholder), so treat anything falsy as "not attached yet".
+    template = getattr(page, "Template", None)
+    if template is None or not hasattr(template, "Template"):
         doc = page.Document
         template = doc.addObject("TechDraw::DrawSVGTemplate", "Template")
-        page.addView(template)
-
     try:
         template.Template = template_path
-    except Exception:
+        # addView() rejects a template - the property is the only supported way
+        # to attach one - and assigning it here also links the object to the page.
+        template.Label = os.path.basename(template_path)
+        if getattr(page, "Template", None) is not template:
+            page.Template = template
+    except Exception as exc:
         # A template SVG the parser dislikes is a hard stop: leaving the old
         # one in place silently would be worse.
+        compat.console_log("apply_template failed for {0}: {1}".format(template_path, exc))
         return None
 
     if keep_scale:
-        ratio = page_scale(page)
-        try:
-            page.ScaleType = "Custom"
-            page.Scale = float(ratio[0]) / float(ratio[1])
-        except Exception:
-            pass
+        # Re-assert the page scale: attaching a template can reset it.
+        set_page_scale(page, page_scale(page), custom=False)
 
     try:
         page.KeepUpdated = True
@@ -390,20 +449,31 @@ def apply_template(page: Any, template_path: str, keep_scale: bool = True) -> An
 # Annotations
 # ---------------------------------------------------------------------------
 def add_annotation(page: Any, text: str, x: float, y: float, font_size: float) -> Any:
-    """Create a bold annotation at ``(x, y)`` millimetres on ``page``."""
+    """Create a bold annotation at ``(x, y)`` millimetres on ``page``.
+
+    ``font_size`` is in millimetres; the point sizes the original used are
+    available as :data:`STAMP_FONT_POINTS` and :data:`SIMETRI_FONT_POINTS`.
+
+    The position is assigned *after* ``addView``: TechDraw centres a view when
+    it is added to a page, so a position set beforehand is silently discarded
+    and the note lands in the middle of the sheet.
+    """
     if page is None:
         return None
     doc = page.Document
-    name = "MrFreeAnno"
-    anno = doc.addObject("TechDraw::DrawViewAnnotation", name)
-    anno.TextSize = float(font_size)
+    anno = doc.addObject("TechDraw::DrawViewAnnotation", "MrFreeAnno")
     anno.Text = ["<b>" + text + "</b>"]
-    anno.X = float(x)
-    anno.Y = float(y)
+    try:
+        anno.TextSize = float(font_size)
+    except Exception as exc:  # pragma: no cover - property rename would land here
+        compat.console_log("annotation font size could not be set: " + str(exc))
     try:
         page.addView(anno)
-    except Exception:
-        pass
+    except Exception as exc:
+        compat.console_log("annotation could not be added to the page: " + str(exc))
+        return None
+    anno.X = float(x)
+    anno.Y = float(y)
     try:
         doc.recompute()
     except Exception:
@@ -573,21 +643,42 @@ def page_scale(page: Any) -> Tuple[int, int]:
 def set_page_scale(page: Any, ratio: Tuple[int, int], custom: bool = True) -> bool:
     """Set the page scale from a ``(numerator, denominator)`` pair.
 
-    ``custom=True`` switches the page to a custom scale instead of one of the
-    named ISO scales, which is required for the ladder's ``1:7``-style steps.
+    ``DrawPage`` exposes only a ``Scale`` float; ``ScaleType`` lives on the
+    *views*.  A view whose ``ScaleType`` is ``Page`` follows the page, which is
+    the arrangement :func:`apply_template` and :mod:`mrfreecad.makedrw` create,
+    so setting the page is normally enough.
+
+    Views set to ``Automatic`` would ignore the page and scale themselves to
+    fit, which silently defeats the operator's chosen scale, so those are
+    switched to ``Page``.  A view already on ``Custom`` keeps its own scale: that
+    was a deliberate per-view decision and overwriting it would lose work.
     """
     if page is None:
         return False
     numerator = max(1, int(ratio[0]))
     denominator = max(1, int(ratio[1]))
     try:
-        if custom:
-            page.ScaleType = "Custom"
         page.Scale = float(numerator) / float(denominator)
-        page.Document.recompute()
     except Exception as exc:
         compat.console_log("set_page_scale failed: " + str(exc))
         return False
+
+    if custom:
+        for view in iter_views(page):
+            try:
+                scale_type = getattr(view, "ScaleType", "Page")
+                # "Automatic" picks its own scale and would silently defeat the
+                # operator's choice, so it follows the page.  "Custom" is a
+                # deliberate per-view scale and is left exactly as it is.
+                if scale_type == "Automatic":
+                    view.ScaleType = "Page"
+            except Exception:
+                continue
+
+    try:
+        page.Document.recompute()
+    except Exception:
+        pass
     return True
 
 

@@ -38,11 +38,14 @@ __all__ = [
     "PROP_DESCRIPTION",
     "PROP_WEIGHT",
     "PROP_MATERIAL",
+    "PROP_MATERIAL_WRITE",
     "PROP_RELIEF",
     "norm_part",
     "apply_preset",
     "read_thickness_property",
     "ensure_property",
+    "property_type",
+    "is_assignment_safe",
     "read_property",
 ]
 
@@ -73,8 +76,16 @@ PROP_WEIGHT = "Weight"
 PROP_MATERIAL = "Material"
 PROP_RELIEF = "MrFreeRelief"
 
+#: Where MrFreeTool *writes* the material name.
+#:
+#: FreeCAD 1.1 gave ``Document`` a built-in ``Material`` property of type
+#: ``App::PropertyMap`` - a dict, not a string.  Assigning a string to it
+#: segfaults FreeCAD inside ``PropertyMap::setPyObject``, so the name is read
+#: but never written.  ``MrFreeMaterial`` is ours and safe to assign.
+PROP_MATERIAL_WRITE = "MrFreeMaterial"
+
 #: Custom property types added to the document.
-_STRING_PROPS = (PROP_DESCRIPTION, PROP_WEIGHT, PROP_MATERIAL, PROP_RELIEF)
+_STRING_PROPS = (PROP_DESCRIPTION, PROP_WEIGHT, PROP_MATERIAL_WRITE, PROP_RELIEF)
 
 
 def preset_for_thickness(thickness: Any) -> Optional[Tuple[str, float, float, float]]:
@@ -124,6 +135,66 @@ def ensure_property(obj: Any, name: str, kind: str = "App::PropertyLength", grou
     return getattr(obj, name, None)
 
 
+#: Property types a plain Python string may be assigned to.  Anything else - a
+#: PropertyMap, a PropertyLinkList, a PropertyEnumeration - must not be written
+#: blindly: FreeCAD's C++ layer has crashed outright on a wrong assignment.
+_STRING_SAFE_TYPES = (
+    "App::PropertyString",
+    "App::PropertyStringList",
+    "App::PropertyFileIncluded",
+)
+
+_NUMBER_SAFE_TYPES = (
+    "App::PropertyLength",
+    "App::PropertyDistance",
+    "App::PropertyFloat",
+    "App::PropertyAngle",
+    "App::PropertyQuantity",
+    "App::PropertyInteger",
+)
+
+_SAFE_BY_KIND = {
+    "App::PropertyString": _STRING_SAFE_TYPES,
+    "App::PropertyLength": _NUMBER_SAFE_TYPES,
+}
+
+
+def property_type(obj: Any, name: str) -> str:
+    """Type id of ``obj``'s property ``name``, or ``""`` when absent."""
+    if obj is None:
+        return ""
+    getter = getattr(obj, "getTypeIdOfProperty", None)
+    if getter is None:
+        return ""
+    try:
+        return str(getter(name))
+    except Exception:
+        return ""
+
+
+def is_assignment_safe(obj: Any, name: str, kind: str) -> bool:
+    """True when a value of ``kind`` may be assigned to ``obj.name``.
+
+    This guard is not defensive decoration.  Assigning a string to FreeCAD
+    1.1's built-in ``Document.Material`` (an ``App::PropertyMap``) segfaults the
+    interpreter inside ``PropertyMap::setPyObject`` - a hard crash of the user's
+    whole session, with no traceback.  A property that already exists with an
+    incompatible type is therefore never written.
+
+    A property that does not exist yet is safe: :func:`ensure_property` will
+    create it with exactly the requested type.
+    """
+    existing = property_type(obj, name)
+    if not existing:
+        return True
+    if existing == kind:
+        return True
+    allowed = _SAFE_BY_KIND.get(kind)
+    if allowed is not None and existing in allowed:
+        return True
+    return False
+
+
 def read_property(obj: Any, name: str, default: Any = None) -> Any:
     """Read a property, returning ``default`` when it is absent or unset."""
     if obj is None:
@@ -138,7 +209,20 @@ def read_property(obj: Any, name: str, default: Any = None) -> Any:
 
 
 def _set_property(obj: Any, name: str, kind: str, value: Any) -> bool:
+    """Write ``value`` into ``obj.name``, refusing an unsafe assignment.
+
+    Returns False rather than raising when the property exists with an
+    incompatible type, and says so in the log - the alternative is the
+    interpreter segfault.
+    """
     if obj is None:
+        return False
+    if not is_assignment_safe(obj, name, kind):
+        compat.console_log(
+            "{0}.{1} is {2}, refusing to write {3} to it (would crash FreeCAD)".format(
+                getattr(obj, "Name", "?"), name, property_type(obj, name) or "unknown", kind
+            )
+        )
         return False
     prop = ensure_property(obj, name, kind)
     if prop is None:
@@ -169,25 +253,27 @@ def read_thickness_property(obj: Any) -> Optional[float]:
     return None
 
 
-def _bind_expression(obj: Any, target: str, source_obj: Any, source_prop: str) -> bool:
-    """Bind ``target`` to ``source_obj.<source_prop>`` via an expression.
+def _bind_description(obj: Any, doc: Any) -> bool:
+    """Keep ``Description`` and the thickness in step.
 
-    Keeps the metadata live - change the thickness and the description follows
-    - which is what the SolidWorks linked properties achieved.
+    An earlier version bound the description to the thickness with
+    ``setExpression``.  Two things rule that out on FreeCAD:
+
+    * a *document* property cannot be expression-bound at all - ``Document`` has
+      no ``ExpressionEngine`` and no ``setExpression``;
+    * binding on the *object* does work, but the expression yields a quantity
+      (``1.50 mm``), which will not populate an ``App::PropertyString`` with the
+      comma-decimal form the DXF file name and the drawing both need.
+
+    So the description is written next to the thickness by both writers, which
+    is what keeps the two consistent.  The indirection is kept as a single
+    function so the intent is recorded and a future FreeCAD that can format a
+    length into a string has one obvious place to change.
     """
-    if obj is None or source_obj is None:
+    thickness = read_thickness_property(obj)
+    if thickness is None or doc is None:
         return False
-    label = str(getattr(source_obj, "Label", "") or "").replace("<<", "").replace(">>", "")
-    if not label:
-        return False
-    if not hasattr(obj, "setExpression"):
-        return False
-    try:
-        obj.setExpression(target, "<<{0}>>.{1}".format(label, source_prop))
-        return True
-    except Exception as exc:
-        compat.console_log("bind {0} failed: {1}".format(target, exc))
-        return False
+    return _set_property(doc, PROP_DESCRIPTION, "App::PropertyString", to_decimal(thickness))
 
 
 # ---------------------------------------------------------------------------
@@ -255,16 +341,16 @@ def norm_part(
     thickness_text = to_decimal(thickness) if thickness is not None else ""
     _set_property(doc, PROP_DESCRIPTION, "App::PropertyString", thickness_text)
     applied.append("Description = " + (thickness_text or "(boş)"))
-    if thickness is not None:
-        _bind_expression(doc, PROP_DESCRIPTION, obj, PROP_THICKNESS)
 
     mass = _estimate_mass_kg(obj)
     _set_property(doc, PROP_WEIGHT, "App::PropertyString", to_decimal(mass, 3) if mass else "")
     applied.append("Weight = " + (to_decimal(mass, 3) + " kg" if mass else "(hesaplanamadı)"))
 
     if material:
-        _set_property(doc, PROP_MATERIAL, "App::PropertyString", material)
-        applied.append("Material = " + material)
+        if _set_property(doc, PROP_MATERIAL_WRITE, "App::PropertyString", material):
+            applied.append("Material = " + material)
+        else:
+            skipped.append("Material (Document.Material tip değişikliği, yazılamadı)")
 
     _apply_unit_schema(unit_schema)
     applied.append("Units = mm/kg (schema {0})".format(unit_schema))
@@ -369,8 +455,9 @@ def apply_preset(
     _set_property(obj, PROP_THICKNESS, "App::PropertyLength", preset_thickness)
     _set_property(obj, PROP_K_FACTOR, "App::PropertyFloat", float(k_factor))
     _set_property(obj, PROP_BEND_RADIUS, "App::PropertyLength", preset_radius)
-    _set_property(doc, PROP_DESCRIPTION, "App::PropertyString", to_decimal(preset_thickness))
-    _bind_expression(doc, PROP_DESCRIPTION, obj, PROP_THICKNESS)
+    # Written alongside the thickness so the two never disagree; see
+    # _bind_description() for why an expression binding is not used.
+    _bind_description(obj, doc)
 
     try:
         doc.recompute()

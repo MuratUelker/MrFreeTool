@@ -375,16 +375,76 @@ def user_template_dir() -> str:
         return ""
 
 
-def builtin_templates(landscape: bool = True) -> List[str]:  # pragma: no cover - host dependent
-    """Names of the TechDraw templates bundled with FreeCAD."""
+def builtin_templates(landscape: bool = True) -> List[str]:
+    """TechDraw templates bundled with FreeCAD, best candidates first.
+
+    FreeCAD keeps most templates in ``ISO/`` and ``ASME/`` subdirectories with
+    only a couple loose in the root, so the search has to recurse - a
+    non-recursive scan finds almost nothing and leaves *Make Drw* without a
+    fallback.
+
+    Ranking matters because a blank template is the one to fall back on: it
+    carries the paper size but no title block, which is the right default for a
+    drawing the user is about to stamp their own notes onto.  Named sizes are
+    preferred so the sheet size is a deliberate choice rather than whatever was
+    first on disk.
+    """
     directory = user_template_dir()
     if not directory or not os.path.isdir(directory):
         return []
-    wanted = ("A3", "A4") if landscape else ("A4", "A3")
-    names = []
-    for entry in sorted(os.listdir(directory)):
-        if not entry.lower().endswith(".svg"):
-            continue
-        if any(entry.startswith(tag) for tag in wanted):
-            names.append(os.path.join(directory, entry))
-    return names
+
+    found: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(directory):
+        dirnames.sort()
+        for name in sorted(filenames):
+            if not name.lower().endswith(".svg"):
+                continue
+            if _template_orientation(name) != ("landscape" if landscape else "portrait"):
+                continue
+            found.append(os.path.join(dirpath, name))
+
+    found.sort(key=_template_rank)
+    return found
+
+
+def _template_rank(path: str) -> Tuple[int, int, str]:
+    """Sort key: neutral English templates first, then named size, then blank.
+
+    Three things are ranked, in order:
+
+    1. ``localized`` — FreeCAD ships translated copies under
+       ``ISO/localized/<lang>/``; English is the sane default for a shop whose
+       other documents are in English.
+    2. paper size — a named size (A3, A4, ...) beats an unsized sheet, so the
+       sheet size is a deliberate choice rather than whatever came first.
+    3. ``blank`` — a blank template carries the frame without someone else's
+       title block, which is the right default for a drawing that is about to be
+       stamped with the user's own notes.
+    """
+    lowered = path.lower()
+    name = os.path.basename(lowered)
+    localized = "localized" in lowered
+    has_size = any(tag in name for tag in ("a0", "a1", "a2", "a3", "a4", "ansia", "ansib", "ansic"))
+    is_blank = "blank" in name
+
+    if has_size and not is_blank:
+        content = 0
+    elif has_size and is_blank:
+        content = 1
+    else:
+        content = 2
+    return (1 if localized else 0, content, name)
+
+
+def _template_orientation(name: str) -> Optional[str]:
+    """``'landscape'``, ``'portrait'`` or ``None`` for a template file name.
+
+    A name that says neither is treated as usable for both, so an untitled
+    sheet is not excluded just because it omits the orientation.
+    """
+    lowered = name.lower()
+    if any(tag in lowered for tag in ("portrait", "vert", "_p.")):
+        return "portrait"
+    if any(tag in lowered for tag in ("landscape", "yatay", "dikey")):
+        return "landscape"
+    return None
